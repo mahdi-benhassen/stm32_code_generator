@@ -1,0 +1,47 @@
+{
+  "STM32F401RETx": {
+    "family": "f4",
+    "part_suffix": "stm32f401xe",
+    "device_define": "STM32F401xE",
+    "cpu": "cortex-m4",
+    "fpu": "fpv4-sp-d16",
+    "float_abi": "hard",
+    "can_type": "none",
+    "gpio_model": "af_number",
+    "flash_origin": "0x08000000",
+    "flash_size_kb": 512,
+    "ram_origin": "0x20000000",
+    "ram_size_kb": 96,
+    "board_note": "Nucleo-F401RE"
+  },
+  "STM32F411CEUx": {
+    "family": "f4",
+    "part_suffix": "stm32f411xe",
+    "device_define": "STM32F411xE",
+    "cpu": "cortex-m4",
+    "fpu": "fpv4-sp-d16",
+    "float_abi": "hard",
+    "can_type": "none",
+    "gpio_model": "af_number",
+    "flash_origin": "0x08000000",
+    "flash_size_kb": 512,
+    "ram_origin": "0x20000000",
+    "ram_size_kb": 128,
+    "board_note": "WeAct Black Pill F411CE"
+  },
+  "STM32F103C8Tx": {
+    "family": "f1",
+    "part_suffix": "stm32f103xb",
+    "device_define": "STM32F103xB",
+    "cpu": "cortex-m3",
+    "fpu": null,
+    "float_abi": "soft",
+    "can_type": "bxcan",
+    "gpio_model": "afio_remap",
+    "flash_origin": "0x08000000",
+    "flash_size_kb": 64,
+    "ram_origin": "0x20000000",
+    "ram_size_kb": 20,
+    "board_note": "\"Blue Pill\" board"
+  }
+}
