@@ -1,95 +1,91 @@
-name: Generate STM32 Project (from ST GitHub sources, no CubeMX)
+name: CI - Test Project Generator
 
-# Runs entirely on a normal GitHub-hosted runner — unlike a CubeMX-based
-# pipeline, nothing here is gated behind a login or needs a GUI/display,
-# since it only vendors source from public STMicroelectronics GitHub repos
-# and writes the application code itself.
+# Regression test for the generator itself (not the user-facing "generate a
+# project on demand" workflow in generate-stm32-project.yml). Runs on every
+# push/PR that touches the generator or the MCU catalog: regenerates a
+# representative project for every MCU in mcu_catalog.json and actually
+# compiles it, so a bad edit to generate_project.py or a bad catalog entry
+# fails CI instead of silently shipping.
+
 on:
-  workflow_dispatch:
-    inputs:
-      mcu:
-        description: "Target microcontroller"
-        type: choice
-        required: true
-        default: STM32F401RETx
-        options:
-          - STM32F401RETx
-          - STM32F411CEUx
-          - STM32F103C8Tx
-      project_name:
-        description: "Project name"
-        type: string
-        default: GeneratedProject
-      editor:
-        description: "Editor / build integration to generate for"
-        type: choice
-        default: makefile
-        options:
-          - makefile
-          - vscode
-          - cubeide
-      build_firmware:
-        description: "Also compile the generated project in this run (sanity check + produces .elf/.hex/.bin)"
-        type: boolean
-        default: true
-
-      enable_usart:
-        description: "Enable USART/UART"
-        type: boolean
-        default: true
-      usart_config:
-        description: 'USART config JSON'
-        type: string
-        default: '{"instance":"USART2","baudrate":115200,"mode":"TX_RX","parity":"NONE","stopbits":1,"wordlength":8}'
-
-      enable_spi:
-        description: "Enable SPI"
-        type: boolean
-        default: false
-      spi_config:
-        description: 'SPI config JSON'
-        type: string
-        default: '{"instance":"SPI1","mode":"MASTER","direction":"2LINES","data_size":8,"clk_polarity":"LOW","clk_phase":"1EDGE","nss":"SOFT","baudrate_prescaler":16}'
-
-      enable_i2c:
-        description: "Enable I2C"
-        type: boolean
-        default: false
-      i2c_config:
-        description: 'I2C config JSON'
-        type: string
-        default: '{"instance":"I2C1","clock_speed_hz":100000}'
-
-      enable_can:
-        description: "Enable CAN (bxCAN — only supported on STM32F103C8Tx in this catalog)"
-        type: boolean
-        default: false
-      can_config:
-        description: 'CAN config JSON'
-        type: string
-        default: '{"instance":"CAN1","mode":"NORMAL","prescaler":4}'
-
-      enable_adc:
-        description: "Enable ADC"
-        type: boolean
-        default: false
-      adc_config:
-        description: 'ADC config JSON'
-        type: string
-        default: '{"instance":"ADC1","channels":["IN0","IN1"]}'
-
-      enable_pwm:
-        description: "Enable Timer PWM"
-        type: boolean
-        default: false
-      pwm_config:
-        description: 'PWM config JSON'
-        type: string
-        default: '{"instance":"TIM2","channels":["CH1","CH2"],"prescaler":83,"period":999}'
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - "mcu_catalog.json"
+      - ".github/workflows/ci-test-generator.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - "mcu_catalog.json"
+  workflow_dispatch: {}
 
 jobs:
-  generate:
+  lint:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Syntax / lint check
+        run: |
+          python3 -m py_compile scripts/generate_project.py
+          ruff check scripts/ --select=E9,F  # only hard errors — this generator
+                                              # leans on long f-string templates
+                                              # that aren't worth full-style linting
+
+  generate-and-build:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One matrix entry per catalog MCU, each exercising a different
+          # combination of interfaces / GPIO model so a regression in any
+          # peripheral builder or in the F1-vs-F4 GPIO branch gets caught.
+          - mcu: STM32F401RETx
+            project_name: CI_F401RE
+            freertos: "false"
+            interfaces: '{"usart":{"instance":"USART2","baudrate":115200},"i2c":{"instance":"I2C1"}}'
+          - mcu: STM32F103C8Tx
+            project_name: CI_BluePill
+            freertos: "false"
+            interfaces: '{"usart":{"instance":"USART1","baudrate":9600},"spi":{"instance":"SPI1"},"i2c":{"instance":"I2C1"},"can":{"instance":"CAN1"}}'
+          - mcu: STM32F411CEUx
+            project_name: CI_F411CE_Minimal
+            freertos: "false"
+            interfaces: "{}"
+          # FreeRTOS regression coverage — one per CPU port variant
+          # (ARM_CM4F vs ARM_CM3), since the SVC/PendSV/SysTick handler
+          # wiring is exactly the kind of thing that compiles fine one way
+          # and silently misbehaves the other.
+          - mcu: STM32F401RETx
+            project_name: CI_F401RE_RTOS
+            freertos: "true"
+            interfaces: '{"usart":{"instance":"USART2","baudrate":115200},"spi":{"instance":"SPI1"}}'
+          - mcu: STM32F103C8Tx
+            project_name: CI_BluePill_RTOS
+            freertos: "true"
+            interfaces: '{"usart":{"instance":"USART1","baudrate":9600}}'
+          # Every supported interface enabled at once, per MCU — this is
+          # what actually caught the F1 ADC field-mismatch bug (F1's older
+          # ADC_InitTypeDef doesn't have ClockPrescaler/Resolution/
+          # EOCSelection at all), since that combination hadn't been
+          # exercised until it was added here.
+          - mcu: STM32F401RETx
+            project_name: CI_F401RE_AllInterfaces
+            freertos: "false"
+            interfaces: '{"usart":{"instance":"USART2","baudrate":115200},"spi":{"instance":"SPI1"},"i2c":{"instance":"I2C1"},"adc":{"instance":"ADC1","channels":["IN0","IN1"]},"pwm":{"instance":"TIM3","channels":["CH3","CH4"]}}'
+          - mcu: STM32F103C8Tx
+            project_name: CI_BluePill_AllInterfaces
+            freertos: "false"
+            interfaces: '{"usart":{"instance":"USART1","baudrate":9600},"spi":{"instance":"SPI1"},"i2c":{"instance":"I2C1"},"can":{"instance":"CAN1"},"adc":{"instance":"ADC1","channels":["IN0","IN1"]},"pwm":{"instance":"TIM3","channels":["CH3","CH4"]}}'
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -99,74 +95,48 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Assemble configuration JSON from form inputs
-        run: |
-          mkdir -p build
-          python3 - <<'PYEOF'
-          import json, os
-
-          def as_bool(v):
-              return str(v).lower() == "true"
-
-          cfg = {
-              "project_name": os.environ["MCU_PROJECT_NAME"],
-              "editor": os.environ["MCU_EDITOR"],
-              "interfaces": {}
-          }
-
-          iface_map = {
-              "usart": ("ENABLE_USART", "USART_CONFIG"),
-              "spi":   ("ENABLE_SPI",   "SPI_CONFIG"),
-              "i2c":   ("ENABLE_I2C",   "I2C_CONFIG"),
-              "can":   ("ENABLE_CAN",   "CAN_CONFIG"),
-              "adc":   ("ENABLE_ADC",   "ADC_CONFIG"),
-              "pwm":   ("ENABLE_PWM",   "PWM_CONFIG"),
-          }
-          for name, (enable_var, config_var) in iface_map.items():
-              cfg["interfaces"][name] = (
-                  json.loads(os.environ[config_var]) if as_bool(os.environ.get(enable_var, "false")) else None
-              )
-
-          with open("build/config.json", "w") as f:
-              json.dump(cfg, f, indent=2)
-          print(json.dumps(cfg, indent=2))
-          PYEOF
-        env:
-          MCU_PROJECT_NAME: ${{ inputs.project_name }}
-          MCU_EDITOR: ${{ inputs.editor }}
-          ENABLE_USART: ${{ inputs.enable_usart }}
-          USART_CONFIG: ${{ inputs.usart_config }}
-          ENABLE_SPI: ${{ inputs.enable_spi }}
-          SPI_CONFIG: ${{ inputs.spi_config }}
-          ENABLE_I2C: ${{ inputs.enable_i2c }}
-          I2C_CONFIG: ${{ inputs.i2c_config }}
-          ENABLE_CAN: ${{ inputs.enable_can }}
-          CAN_CONFIG: ${{ inputs.can_config }}
-          ENABLE_ADC: ${{ inputs.enable_adc }}
-          ADC_CONFIG: ${{ inputs.adc_config }}
-          ENABLE_PWM: ${{ inputs.enable_pwm }}
-          PWM_CONFIG: ${{ inputs.pwm_config }}
-
-      - name: Generate project (vendors ST HAL/CMSIS from GitHub + writes app code)
-        run: |
-          python3 scripts/generate_project.py \
-            --mcu "${{ inputs.mcu }}" \
-            --catalog mcu_catalog.json \
-            --config build/config.json \
-            --output "build/${{ inputs.project_name }}"
-
       - name: Install ARM GCC toolchain
-        if: ${{ inputs.build_firmware == 'true' }}
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-arm-none-eabi
 
-      - name: Build firmware (sanity check)
-        if: ${{ inputs.build_firmware == 'true' }}
+      - name: Write test config
         run: |
-          cd "build/${{ inputs.project_name }}"
+          mkdir -p ci-build
+          python3 - <<'PYEOF'
+          import json, os
+          cfg = {
+              "project_name": os.environ["PROJECT_NAME"],
+              "editor": "makefile",
+              "freertos": os.environ["FREERTOS"].lower() == "true",
+              "interfaces": json.loads(os.environ["IFACE_JSON"]),
+          }
+          with open("ci-build/config.json", "w") as f:
+              json.dump(cfg, f, indent=2)
+          PYEOF
+        env:
+          PROJECT_NAME: ${{ matrix.project_name }}
+          IFACE_JSON: ${{ matrix.interfaces }}
+          FREERTOS: ${{ matrix.freertos }}
+
+      - name: Generate project (vendors ST sources + writes app code)
+        run: |
+          python3 scripts/generate_project.py \
+            --mcu "${{ matrix.mcu }}" \
+            --catalog mcu_catalog.json \
+            --config ci-build/config.json \
+            --output "ci-build/${{ matrix.project_name }}"
+
+      - name: Build firmware
+        run: |
+          cd "ci-build/${{ matrix.project_name }}"
           make
 
-      - name: Upload generated project
+      - name: Report firmware size
+        run: |
+          arm-none-eabi-size "ci-build/${{ matrix.project_name }}/build/${{ matrix.project_name }}.elf"
+
+      - name: Upload build output (debugging aid on failure)
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.project_name }}-${{ inputs.mcu }}
-          path: build/${{ inputs.project_name }}
+          name: ci-debug-${{ matrix.mcu }}
+          path: ci-build/${{ matrix.project_name }}
