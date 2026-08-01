@@ -48,14 +48,26 @@ DEFAULT_PINS = {
         "spi":   {"SPI1": {"sck": "PA5", "miso": "PA6", "mosi": "PA7"}},
         "i2c":   {"I2C1": {"scl": "PB6", "sda": "PB7"}},
         "can":   {"CAN1": {"rx": "PA11", "tx": "PA12"}},
-        "pwm":   {"TIM2": {"CH1": "PA0", "CH2": "PA1", "CH3": "PA2", "CH4": "PA3"}},
+        # TIM2 CH1-4 (PA0-3) is the "natural" PWM default but collides with
+        # ADC1's default IN0/IN1 (also PA0/PA1) when both are enabled at
+        # once. TIM3 CH3/CH4 -> PB0/PB1 is free against every other default
+        # here (verified by actually building all interfaces together —
+        # see the "all interfaces at once" CI matrix entry), so it's the
+        # default `pwm_config` value in the workflow/README/CI. TIM2 is
+        # still usable — just specify pins explicitly if combining it with
+        # ADC on its default channels.
+        "pwm":   {"TIM2": {"CH1": "PA0", "CH2": "PA1", "CH3": "PA2", "CH4": "PA3"},
+                  "TIM3": {"CH3": "PB0", "CH4": "PB1"}},
     },
     "f1": {
         "usart": {"USART1": {"tx": "PA9", "rx": "PA10"}, "USART2": {"tx": "PA2", "rx": "PA3"}},
         "spi":   {"SPI1": {"sck": "PA5", "miso": "PA6", "mosi": "PA7"}},
         "i2c":   {"I2C1": {"scl": "PB6", "sda": "PB7"}},
         "can":   {"CAN1": {"rx": "PA11", "tx": "PA12"}},
-        "pwm":   {"TIM2": {"CH1": "PA0", "CH2": "PA1", "CH3": "PA2", "CH4": "PA3"}},
+        # Same TIM3 CH3/CH4 -> PB0/PB1 default as f4 above; on F1 these are
+        # TIM3's fixed (non-remapped) pins, so no AFIO remap call is needed.
+        "pwm":   {"TIM2": {"CH1": "PA0", "CH2": "PA1", "CH3": "PA2", "CH4": "PA3"},
+                  "TIM3": {"CH3": "PB0", "CH4": "PB1"}},
     },
 }
 
@@ -92,7 +104,12 @@ def modules_for(interfaces: dict, can_type: str):
         if not cfg:
             continue
         if name == "can":
-            mods += ["hal_can"] if can_type == "bxcan" else ["hal_fdcan"]
+            if can_type == "bxcan":
+                mods += ["hal_can"]
+            elif can_type == "fdcan":
+                mods += ["hal_fdcan"]
+            # can_type == "none": nothing to fetch — main() rejects this
+            # combination outright before it'd matter.
         else:
             mods += INTERFACE_MODULES.get(name, [])
     seen = set()
@@ -159,6 +176,176 @@ def fetch_sources(mcu, entry, interfaces, out: Path, scratch: Path):
         "hal_src_files": copied,
         "system_c": f"system_stm32{fam}xx.c",
     }
+
+
+def fetch_freertos(entry, out: Path, scratch: Path):
+    """Vendors FreeRTOS kernel + the GCC Cortex-M port + heap_4 + the
+    CMSIS-RTOS v2 wrapper from STMicroelectronics/stm32-mw-freertos —
+    the same repo ST's own STM32Cube packages use as a submodule."""
+    port = entry["freertos_port"]
+    base = out / "Middlewares/Third_Party/FreeRTOS/Source"
+    (base / "include").mkdir(parents=True, exist_ok=True)
+    (base / f"portable/GCC/{port}").mkdir(parents=True, exist_ok=True)
+    (base / "portable/MemMang").mkdir(parents=True, exist_ok=True)
+    (base / "CMSIS_RTOS_V2").mkdir(parents=True, exist_ok=True)
+
+    print("[fetch] stm32-mw-freertos ...")
+    d = scratch / "stm32-mw-freertos"
+    sparse_clone("stm32-mw-freertos", d, ["Source"])
+
+    for f in (d / "Source").glob("*.c"):
+        shutil.copy(f, base / f.name)
+    for f in (d / "Source/include").glob("*.h"):
+        if f.name == "FreeRTOSConfig_template.h":
+            continue
+        shutil.copy(f, base / "include" / f.name)
+    for name in ("port.c", "portmacro.h"):
+        shutil.copy(d / f"Source/portable/GCC/{port}/{name}", base / f"portable/GCC/{port}/{name}")
+    shutil.copy(d / "Source/portable/MemMang/heap_4.c", base / "portable/MemMang/heap_4.c")
+    for name in ("cmsis_os2.c", "freertos_os2.h", "freertos_mpool.h"):
+        shutil.copy(d / f"Source/CMSIS_RTOS_V2/{name}", base / "CMSIS_RTOS_V2" / name)
+
+    # The CMSIS-RTOS2 API header (cmsis_os2.h) itself is not part of
+    # stm32-mw-freertos — it's a generic, family-independent header ST
+    # tracks directly (not as a submodule) inside each STM32CubeXX monorepo
+    # at Drivers/CMSIS/RTOS2/Include/. Any family's monorepo has the same
+    # file; STM32CubeF4 is used here purely as a stable, always-available
+    # source for it.
+    print("[fetch] CMSIS-RTOS2 API header (from STM32CubeF4) ...")
+    d2 = scratch / "STM32CubeF4-rtos2"
+    sparse_clone("STM32CubeF4", d2, ["Drivers/CMSIS/RTOS2/Include"])
+    shutil.copy(d2 / "Drivers/CMSIS/RTOS2/Include/cmsis_os2.h", base / "CMSIS_RTOS_V2/cmsis_os2.h")
+
+    c_files = [str(f.relative_to(out)) for f in base.glob("*.c")]
+    c_files.append(str((base / f"portable/GCC/{port}/port.c").relative_to(out)))
+    c_files.append(str((base / "portable/MemMang/heap_4.c").relative_to(out)))
+    c_files.append(str((base / "CMSIS_RTOS_V2/cmsis_os2.c").relative_to(out)))
+    include_dirs = [
+        str((base / "include").relative_to(out)),
+        str((base / f"portable/GCC/{port}").relative_to(out)),
+        str((base / "CMSIS_RTOS_V2").relative_to(out)),
+    ]
+    return {"c_files": c_files, "include_dirs": include_dirs}
+
+
+def write_freertos_config(entry, out: Path):
+    """Compact, hand-verified FreeRTOSConfig.h. configMAX_PRIORITIES=56 and
+    the specific INCLUDE_*/config* values below aren't arbitrary -- they are
+    hard requirements enforced by #error checks inside the CMSIS-RTOS2
+    wrapper (freertos_os2.h) that only surface at compile time, confirmed
+    by actually compiling this against it."""
+    hz = entry["hsi_hz"]
+    fam = entry["family"]
+    text = f'''#ifndef FREERTOS_CONFIG_H
+#define FREERTOS_CONFIG_H
+
+/* Required by the CMSIS-RTOS2 wrapper (freertos_os2.h) to pick its device
+ * header -- must match the device header this MCU family uses. */
+#define CMSIS_device_header "stm32{fam}xx.h"
+
+/* configCPU_CLOCK_HZ matches SystemClock_Config()'s default: HSI, no PLL.
+ * If you switch to HSE+PLL for a higher SYSCLK, update this to match, or
+ * the RTOS tick period (and therefore every osDelay()/vTaskDelay()) will
+ * be wrong. */
+#define configCPU_CLOCK_HZ                      ( ( unsigned long ) {hz} )
+#define configTICK_RATE_HZ                      ( ( TickType_t ) 1000 )
+#define configUSE_PREEMPTION                    1
+#define configUSE_PORT_OPTIMISED_TASK_SELECTION 0
+#define configUSE_TICKLESS_IDLE                 0
+
+/* configMAX_PRIORITIES must be exactly 56 -- the CMSIS-RTOS2 wrapper maps
+ * its osPriority_t scale (1..56) directly onto FreeRTOS priorities and
+ * #errors at compile time if this isn't 56. */
+#define configMAX_PRIORITIES                    ( 56 )
+#define configMINIMAL_STACK_SIZE                ( ( unsigned short ) 128 )
+#define configTOTAL_HEAP_SIZE                   ( ( size_t ) ( 8 * 1024 ) )
+#define configMAX_TASK_NAME_LEN                 ( 16 )
+#define configUSE_16_BIT_TICKS                  0
+#define configIDLE_SHOULD_YIELD                 1
+#define configUSE_MUTEXES                       1
+#define configUSE_RECURSIVE_MUTEXES             1
+#define configUSE_COUNTING_SEMAPHORES           1
+#define configQUEUE_REGISTRY_SIZE               8
+#define configUSE_QUEUE_SETS                    0
+#define configUSE_TIME_SLICING                  1
+#define configSUPPORT_STATIC_ALLOCATION         0
+#define configSUPPORT_DYNAMIC_ALLOCATION        1
+
+/* Hooks */
+#define configUSE_IDLE_HOOK                     0
+#define configUSE_TICK_HOOK                     0
+#define configUSE_MALLOC_FAILED_HOOK            1
+#define configCHECK_FOR_STACK_OVERFLOW          2
+#define configUSE_APPLICATION_TASK_TAG          0
+
+/* configUSE_TRACE_FACILITY must be 1 -- required by the wrapper's
+ * osThreadEnumerate() implementation. */
+#define configGENERATE_RUN_TIME_STATS           0
+#define configUSE_TRACE_FACILITY                1
+#define configUSE_STATS_FORMATTING_FUNCTIONS    0
+
+/* Software timers */
+#define configUSE_TIMERS                        1
+#define configTIMER_TASK_PRIORITY               ( configMAX_PRIORITIES - 1 )
+#define configTIMER_QUEUE_LENGTH                10
+#define configTIMER_TASK_STACK_DEPTH            configMINIMAL_STACK_SIZE
+
+/* Co-routines -- unused */
+#define configUSE_CO_ROUTINES                   0
+#define configMAX_CO_ROUTINE_PRIORITIES         1
+
+/* Optional API inclusions. uxTaskGetStackHighWaterMark, xTimerPendFunctionCall,
+ * xTaskAbortDelay, xTaskGetHandle and xSemaphoreGetMutexHolder are required
+ * (=1) by the CMSIS-RTOS2 wrapper, not optional here despite the name. */
+#define INCLUDE_vTaskPrioritySet                  1
+#define INCLUDE_uxTaskPriorityGet                 1
+#define INCLUDE_vTaskDelete                       1
+#define INCLUDE_vTaskSuspend                      1
+#define INCLUDE_vTaskDelayUntil                   1
+#define INCLUDE_vTaskDelay                        1
+#define INCLUDE_xTaskGetSchedulerState             1
+#define INCLUDE_xTaskGetCurrentTaskHandle          1
+#define INCLUDE_uxTaskGetStackHighWaterMark        1
+#define INCLUDE_xTaskGetIdleTaskHandle             0
+#define INCLUDE_eTaskGetState                      1
+#define INCLUDE_xTimerPendFunctionCall             1
+#define INCLUDE_xTaskAbortDelay                    1
+#define INCLUDE_xTaskGetHandle                     1
+#define INCLUDE_xTaskResumeFromISR                 1
+#define INCLUDE_xSemaphoreGetMutexHolder           1
+
+/* Cortex-M interrupt priority configuration. All the STM32 parts in this
+ * catalog implement 4 NVIC priority bits (16 levels) -- verify against your
+ * exact part's reference manual if you add one that differs. */
+#define configPRIO_BITS                          4
+#define configLIBRARY_LOWEST_INTERRUPT_PRIORITY  15
+#define configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY 5
+#define configKERNEL_INTERRUPT_PRIORITY \\
+    ( configLIBRARY_LOWEST_INTERRUPT_PRIORITY << (8 - configPRIO_BITS) )
+#define configMAX_SYSCALL_INTERRUPT_PRIORITY \\
+    ( configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY << (8 - configPRIO_BITS) )
+
+#define configASSERT( x ) if ((x) == 0) {{ taskDISABLE_INTERRUPTS(); for(;;); }}
+
+/* Let FreeRTOS's own port.c provide SVC_Handler/PendSV_Handler directly --
+ * see stm32{fam}xx_it.c for how SysTick_Handler is shared between
+ * HAL_IncTick() and the RTOS tick instead of being remapped here. */
+#define vPortSVCHandler    SVC_Handler
+#define xPortPendSVHandler PendSV_Handler
+
+/* The CMSIS-RTOS2 wrapper (cmsis_os2.c) ships its own SysTick_Handler by
+ * default (guarded by `#if USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION == 0`,
+ * which is the case whenever this macro is left undefined, since an
+ * undefined identifier in a preprocessor #if evaluates to 0). Its version
+ * only calls xPortSysTickHandler() and never HAL_IncTick(), which would
+ * silently hang every HAL_Delay()/HAL_GetTick()-based timeout forever.
+ * Setting this to 1 makes cmsis_os2.c step aside so stm32{fam}xx_it.c's
+ * SysTick_Handler (which calls both) is the only one that gets linked. */
+#define USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION 1
+
+#endif /* FREERTOS_CONFIG_H */
+'''
+    (out / "Core/Inc/FreeRTOSConfig.h").write_text(text)
 
 
 # ---------------------------------------------------------------------------
@@ -294,26 +481,61 @@ def build_can_bxcan(cfg, fam, af_table):
                        gpio, f"__HAL_RCC_{inst}_CLK_ENABLE", f"{inst}_RX0_IRQn")
 
 
-def build_adc(cfg, fam, af_table):
+def build_adc(cfg, fam, af_table, adc_style="standard"):
     inst = cfg["instance"]
     channels = cfg.get("channels", ["IN0"])
     # ADC input pins on F4/F1: ADC1 IN0..IN7 = PA0..PA7 (very common convention)
     ch_pin_map = {"IN0": "PA0", "IN1": "PA1", "IN2": "PA2", "IN3": "PA3",
                   "IN4": "PA4", "IN5": "PA5", "IN6": "PA6", "IN7": "PA7"}
     var = f"h{inst.lower()}"
-    rank_lines = []
     gpio = []
-    for i, ch in enumerate(channels):
-        pin = ch_pin_map.get(ch, "PA0")
-        gpio.append({"port": pin[1], "num": int(pin[2:]), "mode": "ANALOG", "af": None, "pull": "NOPULL", "speed": None})
-        rank_lines.append(f"""  sConfig.Channel = ADC_CHANNEL_{ch.replace('IN', '')};
+    rank_lines = []
+
+    if adc_style == "legacy":
+        # F1's ADC_InitTypeDef/ADC_ChannelConfTypeDef are the older, simpler
+        # IP version: no ClockPrescaler/Resolution/EOCSelection/
+        # DMAContinuousRequests fields, and SamplingTime uses a different
+        # macro family (ADC_SAMPLETIME_1CYCLE_5, not ADC_SAMPLETIME_3CYCLES).
+        # Confirmed by an actual F1 build failure — this is not a hypothetical.
+        sample_time = "ADC_SAMPLETIME_1CYCLE_5"
+        for i, ch in enumerate(channels):
+            pin = ch_pin_map.get(ch, "PA0")
+            gpio.append({"port": pin[1], "num": int(pin[2:]), "mode": "ANALOG", "af": None, "pull": "NOPULL", "speed": None})
+            rank_lines.append(f"""  sConfig.Channel = ADC_CHANNEL_{ch.replace('IN', '')};
   sConfig.Rank = {i + 1};
-  sConfig.SamplingTime = ADC_SAMPLETIME_15CYCLES;
+  sConfig.SamplingTime = {sample_time};
   if (HAL_ADC_ConfigChannel(&{var}, &sConfig) != HAL_OK)
   {{
     Error_Handler();
   }}""")
-    body = f"""  ADC_ChannelConfTypeDef sConfig = {{0}};
+        body = f"""  ADC_ChannelConfTypeDef sConfig = {{0}};
+
+  {var}.Instance = {inst};
+  {var}.Init.DataAlign = ADC_DATAALIGN_{cfg.get('alignment', 'RIGHT')};
+  {var}.Init.ScanConvMode = {"ENABLE" if len(channels) > 1 else "DISABLE"};
+  {var}.Init.ContinuousConvMode = {"ENABLE" if cfg.get('continuous_mode') else "DISABLE"};
+  {var}.Init.NbrOfConversion = {len(channels)};
+  {var}.Init.DiscontinuousConvMode = DISABLE;
+  {var}.Init.NbrOfDiscConversion = 1;
+  {var}.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  if (HAL_ADC_Init(&{var}) != HAL_OK)
+  {{
+    Error_Handler();
+  }}
+""" + "\n".join(rank_lines)
+    else:
+        sample_time = "ADC_SAMPLETIME_15CYCLES"
+        for i, ch in enumerate(channels):
+            pin = ch_pin_map.get(ch, "PA0")
+            gpio.append({"port": pin[1], "num": int(pin[2:]), "mode": "ANALOG", "af": None, "pull": "NOPULL", "speed": None})
+            rank_lines.append(f"""  sConfig.Channel = ADC_CHANNEL_{ch.replace('IN', '')};
+  sConfig.Rank = {i + 1};
+  sConfig.SamplingTime = {sample_time};
+  if (HAL_ADC_ConfigChannel(&{var}, &sConfig) != HAL_OK)
+  {{
+    Error_Handler();
+  }}""")
+        body = f"""  ADC_ChannelConfTypeDef sConfig = {{0}};
 
   {var}.Instance = {inst};
   {var}.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
@@ -332,6 +554,7 @@ def build_adc(cfg, fam, af_table):
     Error_Handler();
   }}
 """ + "\n".join(rank_lines)
+
     return Peripheral(inst, var, "ADC_HandleTypeDef", f"MX_{inst}_Init", body,
                        gpio, f"__HAL_RCC_{inst}_CLK_ENABLE", f"{inst}_IRQn")
 
@@ -464,7 +687,7 @@ void HAL_MspInit(void)
     (out / "Core/Src" / f"stm32{fam}xx_hal_msp.c").write_text(text)
 
 
-def write_main_files(mcu, entry, project_name, peripherals, out: Path):
+def write_main_files(mcu, entry, project_name, peripherals, out: Path, freertos=False):
     fam = entry["family"]
     decls = "\n".join(f"{p.handle_type} {p.var};" for _, p in peripherals)
     protos = "\n".join(f"static void {p.init_func}(void);" for _, p in peripherals)
@@ -473,6 +696,66 @@ def write_main_files(mcu, entry, project_name, peripherals, out: Path):
 {{
 {p.init_body}
 }}""" for _, p in peripherals)
+
+    if freertos:
+        rtos_include = '#include "cmsis_os2.h"\n'
+        rtos_decls = """
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};"""
+        rtos_proto = "void StartDefaultTask(void *argument);\n"
+        loop_section = """  /* USER CODE BEGIN WHILE */
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* Create the thread(s) */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler,
+     but define a loop in case we do */
+  while (1)
+  {
+  /* USER CODE END WHILE */
+
+  /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  */
+void StartDefaultTask(void *argument)
+{
+  /* USER CODE BEGIN StartDefaultTask */
+  for (;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartDefaultTask */
+}"""
+    else:
+        rtos_include = ""
+        rtos_decls = ""
+        rtos_proto = ""
+        loop_section = """  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+  /* USER CODE END WHILE */
+
+  /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}"""
 
     main_c = f"""/* USER CODE BEGIN Header */
 /**
@@ -486,17 +769,18 @@ def write_main_files(mcu, entry, project_name, peripherals, out: Path):
   */
 /* USER CODE END Header */
 #include "main.h"
-
+{rtos_include}
 /* USER CODE BEGIN Includes */
 /* USER CODE END Includes */
 
 /* Private variables ---------------------------------------------------------*/
 {decls}
+{rtos_decls}
 
 /* Private function prototypes ------------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-{protos}
+{protos}{rtos_proto}
 
 /* USER CODE BEGIN 0 */
 /* USER CODE END 0 */
@@ -542,15 +826,7 @@ int main(void)
   MX_GPIO_Init();
   {calls}
 
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {{
-  /* USER CODE END WHILE */
-
-  /* USER CODE BEGIN 3 */
-  }}
-  /* USER CODE END 3 */
-}}
+{loop_section}
 
 static void MX_GPIO_Init(void)
 {{
@@ -602,7 +878,7 @@ void Error_Handler(void);
     (out / "Core/Inc/main.h").write_text(main_h)
 
 
-def write_it_files(fam, peripherals, out: Path):
+def write_it_files(fam, peripherals, out: Path, freertos=False):
     irqs = sorted({p.irq_name for _, p in peripherals if p.irq_name})
     handler_names = {irq: irq.replace("_IRQn", "_IRQHandler") for irq in irqs}
     handlers_h = "\n".join(f"void {h}(void);" for h in handler_names.values())
@@ -638,21 +914,45 @@ void SysTick_Handler(void);
 """
     (out / f"Core/Inc/stm32{fam}xx_it.h").write_text(it_h)
 
+    if freertos:
+        # port.c (FreeRTOS) supplies SVC_Handler/PendSV_Handler itself, via
+        # the vPortSVCHandler/xPortPendSVHandler #define remap in
+        # FreeRTOSConfig.h — defining them again here would be a duplicate
+        # symbol at link time, so they're deliberately NOT defined below.
+        rtos_includes = ('#include "FreeRTOS.h"\n#include "task.h"\n\n'
+                          '/* xPortSysTickHandler is defined in FreeRTOS\'s port.c but only\n'
+                          ' * forward-declared there (not exported via any FreeRTOS header),\n'
+                          ' * so it needs an explicit extern here. */\n'
+                          'extern void xPortSysTickHandler(void);\n')
+        svc_pendsv_stubs = ""
+        systick_body = """void SysTick_Handler(void)
+{
+  HAL_IncTick();
+#if (INCLUDE_xTaskGetSchedulerState == 1)
+  if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)
+  {
+    xPortSysTickHandler();
+  }
+#endif
+}"""
+    else:
+        rtos_includes = ""
+        svc_pendsv_stubs = "void SVC_Handler(void) {}\nvoid PendSV_Handler(void) {}\n"
+        systick_body = """void SysTick_Handler(void)
+{
+  HAL_IncTick();
+}"""
+
     it_c = f"""#include "main.h"
 #include "stm32{fam}xx_it.h"
-
+{rtos_includes}
 void NMI_Handler(void) {{ while (1) {{}} }}
 void HardFault_Handler(void) {{ while (1) {{}} }}
 void MemManage_Handler(void) {{ while (1) {{}} }}
 void BusFault_Handler(void) {{ while (1) {{}} }}
 void UsageFault_Handler(void) {{ while (1) {{}} }}
-void SVC_Handler(void) {{}}
-void DebugMon_Handler(void) {{}}
-void PendSV_Handler(void) {{}}
-void SysTick_Handler(void)
-{{
-  HAL_IncTick();
-}}
+{svc_pendsv_stubs}void DebugMon_Handler(void) {{}}
+{systick_body}
 
 {handlers_c}
 """
@@ -762,7 +1062,8 @@ SECTIONS
     (out / f"{project_name}.ld").write_text(text)
 
 
-def write_makefile(mcu, entry, project_name, startup_file, hal_src_files, system_c, out: Path):
+def write_makefile(mcu, entry, project_name, startup_file, hal_src_files, system_c, out: Path,
+                    extra_c_sources=None, extra_include_dirs=None):
     fam = entry["family"]
     fpu_flags = ""
     if entry.get("fpu"):
@@ -770,7 +1071,10 @@ def write_makefile(mcu, entry, project_name, startup_file, hal_src_files, system
 
     c_sources = ["Core/Src/main.c", f"Core/Src/stm32{fam}xx_it.c", f"Core/Src/stm32{fam}xx_hal_msp.c",
                  f"Core/Src/{system_c}"] + [f"Drivers/STM32{fam.upper()}xx_HAL_Driver/Src/{f}" for f in hal_src_files]
+    c_sources += extra_c_sources or []
     c_sources_str = " \\\n\t".join(c_sources)
+
+    extra_includes = "".join(f" \\\n\t-I{d}" for d in (extra_include_dirs or []))
 
     text = f"""# Auto-generated Makefile for {project_name} ({mcu})
 # Works standalone (make / make flash) and can be imported into
@@ -785,7 +1089,7 @@ C_INCLUDES = \\
 \t-ICore/Inc \\
 \t-IDrivers/STM32{fam.upper()}xx_HAL_Driver/Inc \\
 \t-IDrivers/CMSIS/Device/ST/STM32{fam.upper()}xx/Include \\
-\t-IDrivers/CMSIS/Include
+\t-IDrivers/CMSIS/Include{extra_includes}
 
 C_SOURCES = \\
 \t{c_sources_str}
@@ -910,6 +1214,12 @@ def main():
     interfaces = cfg.get("interfaces", {})
     project_name = cfg.get("project_name", "GeneratedProject")
     editor = cfg.get("editor", "makefile")
+    freertos = bool(cfg.get("freertos", False))
+    if freertos and not entry.get("freertos_port"):
+        sys.exit(f"ERROR: FreeRTOS was requested but {args.mcu} has no 'freertos_port' "
+                 f"in the catalog. Add one before requesting FreeRTOS for this MCU — "
+                 f"silently generating a bare-metal project instead of what was asked "
+                 f"for is exactly the kind of surprise this generator should not produce.")
 
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -928,19 +1238,39 @@ def main():
             if entry.get("can_type") == "bxcan":
                 peripherals.append((name, build_can_bxcan(cfg_iface, fam, af_table)))
             else:
-                print(f"[warn] CAN requested but can_type='{entry.get('can_type')}' "
-                      f"is not yet implemented by this generator — skipping.")
+                sys.exit(f"ERROR: CAN was requested but can_type="
+                          f"'{entry.get('can_type')}' for {args.mcu} is not supported "
+                          f"by this generator (only 'bxcan' is implemented). Either "
+                          f"pick a different MCU, disable CAN, or implement FDCAN "
+                          f"support in build_can_fdcan() first — a project that "
+                          f"silently omits an interface you asked for is worse than "
+                          f"one that refuses to generate.")
+            continue
+        if name == "adc":
+            peripherals.append((name, build_adc(cfg_iface, fam, af_table,
+                                                 adc_style=entry.get("adc_style", "standard"))))
             continue
         builder = BUILDERS.get(name)
         if builder:
             peripherals.append((name, builder(cfg_iface, fam, af_table)))
+        else:
+            sys.exit(f"ERROR: unknown interface '{name}' in config — no builder "
+                      f"registered for it in BUILDERS.")
 
-    write_main_files(args.mcu, entry, project_name, peripherals, out)
-    write_it_files(fam, peripherals, out)
+    extra_c_sources, extra_include_dirs = [], []
+    if freertos:
+        rtos_result = fetch_freertos(entry, out, scratch)
+        write_freertos_config(entry, out)
+        extra_c_sources = rtos_result["c_files"]
+        extra_include_dirs = rtos_result["include_dirs"]
+
+    write_main_files(args.mcu, entry, project_name, peripherals, out, freertos=freertos)
+    write_it_files(fam, peripherals, out, freertos=freertos)
     write_hal_msp(fam, entry["gpio_model"], peripherals, out)
     write_linker_script(entry, project_name, out)
     write_makefile(args.mcu, entry, project_name, fetch_result["startup_file"],
-                    fetch_result["hal_src_files"], fetch_result["system_c"], out)
+                    fetch_result["hal_src_files"], fetch_result["system_c"], out,
+                    extra_c_sources=extra_c_sources, extra_include_dirs=extra_include_dirs)
     write_editor_files(editor, args.mcu, entry, project_name, out)
 
     print(f"\n[done] Generated project at {out}")
