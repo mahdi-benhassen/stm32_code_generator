@@ -12,7 +12,10 @@
     "flash_size_kb": 512,
     "ram_origin": "0x20000000",
     "ram_size_kb": 96,
-    "board_note": "Nucleo-F401RE"
+    "board_note": "Nucleo-F401RE",
+    "hsi_hz": 16000000,
+    "freertos_port": "ARM_CM4F",
+    "adc_style": "standard"
   },
   "STM32F411CEUx": {
     "family": "f4",
@@ -27,7 +30,10 @@
     "flash_size_kb": 512,
     "ram_origin": "0x20000000",
     "ram_size_kb": 128,
-    "board_note": "WeAct Black Pill F411CE"
+    "board_note": "WeAct Black Pill F411CE",
+    "hsi_hz": 16000000,
+    "freertos_port": "ARM_CM4F",
+    "adc_style": "standard"
   },
   "STM32F103C8Tx": {
     "family": "f1",
@@ -42,6 +48,9 @@
     "flash_size_kb": 64,
     "ram_origin": "0x20000000",
     "ram_size_kb": 20,
-    "board_note": "\"Blue Pill\" board"
+    "board_note": "\"Blue Pill\" board",
+    "hsi_hz": 8000000,
+    "freertos_port": "ARM_CM3",
+    "adc_style": "legacy"
   }
 }
