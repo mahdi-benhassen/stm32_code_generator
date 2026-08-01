@@ -136,7 +136,7 @@ def fetch_sources(mcu, entry, interfaces, out: Path, scratch: Path):
     cmsis_core_inc = out / "Drivers/CMSIS/Include"
     cmsis_core_inc.mkdir(parents=True, exist_ok=True)
 
-    print(f"[fetch] cmsis-core ...")
+    print("[fetch] cmsis-core ...")
     d = scratch / "cmsis-core"
     sparse_clone("cmsis-core", d, ["CMSIS/Core/Include"])
     shutil.copytree(d / "CMSIS/Core/Include", cmsis_core_inc, dirs_exist_ok=True)
