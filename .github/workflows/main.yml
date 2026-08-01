@@ -13,7 +13,8 @@ on:
     paths:
       - "scripts/**"
       - "mcu_catalog.json"
-      - ".github/workflows/ci-test-generator.yml"
+      - ".github/workflows/main.yml"
+      - ".github/workflows/generate-stm32-project.yml"
   pull_request:
     branches: [main]
     paths:
